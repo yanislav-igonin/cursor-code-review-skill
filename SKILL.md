@@ -1,14 +1,14 @@
 ---
 name: cursor-code-review
-description: Use when an implementation task changed code, tests, configuration, build scripts, generated artifacts, or executable behavior and local verification is complete, before claiming the task is finished.
+description: Use only when the user explicitly requests Cursor review, asks to review through Cursor, says "проверь через Cursor" or "запусти Cursor review", or invokes $cursor-code-review or /cursor-code-review. Do not use for generic implementation, completion, verification, or code-review requests that do not name Cursor.
 compatibility: Requires Bash, Git, awk, jq, network access, and an authenticated Cursor Agent CLI available as agent.
 ---
 
 # Cursor Code Review
 
-Require an independent Cursor review after local verification. Cursor supplies
-evidence; the calling agent remains responsible for deciding whether each
-finding is valid.
+Run an independent Cursor review only when the user explicitly requests it.
+Cursor supplies evidence; the calling agent remains responsible for deciding
+whether each finding is valid.
 
 ## Recursion Guard
 
@@ -17,28 +17,27 @@ start another review.
 
 ## Required Workflow
 
-1. Finish implementation and run the project's normal verification.
-2. Resolve `scripts/review.sh` relative to this `SKILL.md`, not the project.
-3. From inside the changed Git worktree, run:
+1. Confirm the user explicitly requested Cursor review.
+2. Run relevant local verification when available.
+3. Resolve `scripts/review.sh` relative to this `SKILL.md`.
+4. From inside the changed Git worktree: Run `scripts/review.sh` exactly once.
 
    ```bash
    <skill-directory>/scripts/review.sh \
      "<task summary and acceptance criteria>" \
-     "<tests, type checks, lint, or other verification performed>"
+     "<verification performed>"
    ```
 
-4. Handle the exit code:
+5. Handle the exit code:
 
    | Exit | Meaning | Action |
    |---|---|---|
    | `0` | Review passed | Report external review passed. |
    | `1` | Findings | Validate each finding; fix only technically valid ones. |
-   | `2` | Review failed | Retry transient failures; never call failure approval. |
+   | `2` | Review failed | Report the operational failure; never call failure approval. |
 
-5. After valid fixes, rerun local verification, then Cursor review.
-6. Use a maximum of three review cycles total.
-7. Report unresolved findings or unavailable review explicitly. Do not claim a
-   clean external review.
+6. Validate and report the result. Do not automatically fix and re-review.
+7. A new explicit user request is required for another review.
 
 ## Review Discipline
 
@@ -46,12 +45,13 @@ start another review.
 - The runner fingerprints Git-visible worktree state and turns any persistent
   reviewer mutation into exit `2`; inspect such changes instead of trusting the
   verdict.
+- The runner emits a heartbeat every 30 seconds and stops Cursor after 10
+  minutes by default. A timeout is exit `2`, not approval.
 - Reject stylistic preferences and speculative refactors outside task scope.
 - Include final Cursor verdict and unresolved validated findings in handoff.
 
 ## Red Flags
 
-- Claiming completion before invoking the script.
 - Treating every model comment as correct.
 - Treating exit `2` as PASS.
-- Starting a fourth review cycle.
+- Running another review without a new explicit user request.

@@ -31,6 +31,14 @@ task_summary="${1:-}"
 verification="${2:-Not provided}"
 [[ -n "$task_summary" ]] ||
   die "usage: review.sh TASK_SUMMARY [VERIFICATION_EVIDENCE]"
+timeout_seconds="${CURSOR_REVIEW_TIMEOUT_SECONDS:-600}"
+heartbeat_seconds="${CURSOR_REVIEW_HEARTBEAT_SECONDS:-30}"
+case "$timeout_seconds" in
+  ''|*[!0-9]*|0) die "CURSOR_REVIEW_TIMEOUT_SECONDS must be a positive integer" ;;
+esac
+case "$heartbeat_seconds" in
+  ''|*[!0-9]*|0) die "CURSOR_REVIEW_HEARTBEAT_SECONDS must be a positive integer" ;;
+esac
 
 prompt="$(printf '%s\n' \
   'Act as an independent code reviewer. Do not modify files or run destructive commands.' \
@@ -44,27 +52,87 @@ prompt="$(printf '%s\n' \
   'For each finding include severity (critical, high, medium, or low), file:line when applicable, evidence, and the smallest practical fix.' \
   'Include exactly one standalone verdict line: VERDICT: PASS when there are no actionable findings, otherwise VERDICT: FAIL.')"
 
-stderr_file="$(mktemp)" || die "could not create temporary stderr file"
-trap 'rm -f "$stderr_file"' EXIT
+stdout_file="$(mktemp)" || die "could not create temporary stdout file"
+stderr_file="$(mktemp)" || {
+  rm -f "$stdout_file"
+  die "could not create temporary stderr file"
+}
+timeout_marker="${stderr_file}.timeout"
+agent_pid=""
+monitor_pid=""
+
+stop_process_group() {
+  local pid="$1"
+  local signal="${2:-TERM}"
+  [[ -n "$pid" ]] || return 0
+  kill "-$signal" -- "-$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  stop_process_group "$monitor_pid" KILL
+  stop_process_group "$agent_pid" KILL
+  rm -f "$stdout_file" "$stderr_file" "$timeout_marker"
+}
+
+trap cleanup EXIT
+trap 'exit 2' INT TERM HUP
 before_fingerprint="$(worktree_fingerprint)" ||
   die "could not fingerprint Git worktree before review"
 
-output="$(
-  CURSOR_REVIEW_ACTIVE=1 agent -p \
-    --mode=ask \
-    --trust \
-    --sandbox=enabled \
-    --model cursor-grok-4.5-high \
-    --output-format=json \
-    --workspace "$repo_root" \
-    "$prompt" 2>"$stderr_file"
-)"
+set -m
+CURSOR_REVIEW_ACTIVE=1 agent -p \
+  --mode=ask \
+  --trust \
+  --sandbox=enabled \
+  --model cursor-grok-4.5-high \
+  --output-format=json \
+  --workspace "$repo_root" \
+  "$prompt" >"$stdout_file" 2>"$stderr_file" &
+agent_pid=$!
+
+(
+  elapsed=0
+  while kill -0 "$agent_pid" 2>/dev/null; do
+    interval="$heartbeat_seconds"
+    remaining=$((timeout_seconds - elapsed))
+    [[ "$interval" -le "$remaining" ]] || interval="$remaining"
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+    kill -0 "$agent_pid" 2>/dev/null || exit 0
+    printf 'cursor-code-review: review still running (%ss)\n' "$elapsed" >&2
+    if [[ "$elapsed" -ge "$timeout_seconds" ]]; then
+      : >"$timeout_marker"
+      stop_process_group "$agent_pid" TERM
+      grace_elapsed=0
+      while kill -0 "$agent_pid" 2>/dev/null && [[ "$grace_elapsed" -lt 5 ]]; do
+        sleep 1
+        grace_elapsed=$((grace_elapsed + 1))
+      done
+      kill -0 "$agent_pid" 2>/dev/null &&
+        stop_process_group "$agent_pid" KILL
+      exit 0
+    fi
+  done
+) &
+monitor_pid=$!
+
+wait "$agent_pid"
 agent_status=$?
+agent_pid=""
+stop_process_group "$monitor_pid" TERM
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+set +m
+output="$(<"$stdout_file")"
 after_fingerprint="$(worktree_fingerprint)" ||
   die "could not fingerprint Git worktree after review"
 if [[ "$before_fingerprint" != "$after_fingerprint" ]]; then
   cat "$stderr_file" >&2
   die "Cursor Agent modified the Git worktree; inspect changes before continuing"
+fi
+if [[ -f "$timeout_marker" ]]; then
+  cat "$stderr_file" >&2
+  die "Cursor Agent timed out after $timeout_seconds seconds"
 fi
 if [[ $agent_status -ne 0 ]]; then
   cat "$stderr_file" >&2

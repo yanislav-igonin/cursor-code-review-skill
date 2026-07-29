@@ -1,5 +1,10 @@
 # Cursor Code Review Skill Design
 
+> **Superseded behavior:** The explicit-trigger and timeout design dated
+> 2026-07-29 replaces automatic invocation, the three-cycle review loop,
+> automatic retries, and unbounded execution. This document remains as the
+> original design history.
+
 ## Goal
 
 Create a reusable Agent Skill that requires an independent, read-only review by

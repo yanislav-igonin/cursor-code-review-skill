@@ -9,7 +9,7 @@ cleanup_fixture() {
   if [[ -n "${FIXTURE:-}" && -d "$FIXTURE" ]]; then
     rm -rf "$FIXTURE"
   fi
-  unset AGENT_ARGS_FILE AGENT_ENV_FILE AGENT_MUTATE_PATH
+  unset AGENT_ARGS_FILE AGENT_ENV_FILE AGENT_MUTATE_PATH AGENT_SLEEP_SECONDS
   unset AGENT_OUTPUT AGENT_STDERR AGENT_EXIT
 }
 
@@ -44,6 +44,7 @@ make_fixture() {
     'printf "%s\n" "$@" >"$AGENT_ARGS_FILE"' \
     'printf "%s\n" "${CURSOR_REVIEW_ACTIVE:-}" >"$AGENT_ENV_FILE"' \
     'if [[ -n "${AGENT_MUTATE_PATH:-}" ]]; then printf "mutated\n" >"$AGENT_MUTATE_PATH"; fi' \
+    'sleep "${AGENT_SLEEP_SECONDS:-0}"' \
     'printf "%s\n" "${AGENT_STDERR:-}" >&2' \
     'printf "%s\n" "${AGENT_OUTPUT:-}"' \
     'exit "${AGENT_EXIT:-0}"' \
@@ -219,6 +220,57 @@ test_multiple_verdict_lines_are_protocol_failure() {
   [[ $? -eq 2 ]]
 }
 
+test_skill_requires_explicit_cursor_request() {
+  local skill="$ROOT/SKILL.md"
+  local runner="$ROOT/scripts/review.sh"
+  grep -Fq -- 'only when the user explicitly requests' "$skill" &&
+    grep -Fq -- '$cursor-code-review' "$skill" &&
+    grep -Fq -- '/cursor-code-review' "$skill" &&
+    grep -Fq -- 'Run `scripts/review.sh` exactly once' "$skill" &&
+    grep -Fq -- 'A new explicit user request is required for another review' "$skill" &&
+    grep -Fq -- 'heartbeat every 30 seconds' "$skill" &&
+    grep -Fq -- 'after 10' "$skill" &&
+    grep -Fq -- 'CURSOR_REVIEW_TIMEOUT_SECONDS:-600' "$runner" &&
+    grep -Fq -- 'CURSOR_REVIEW_HEARTBEAT_SECONDS:-30' "$runner" &&
+    ! grep -Fq -- 'before claiming the task is finished' "$skill" &&
+    ! grep -Fq -- 'maximum of three review cycles' "$skill"
+}
+
+test_invalid_timeout_is_rejected() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    CURSOR_REVIEW_TIMEOUT_SECONDS=0 PATH="$FIXTURE/bin:$PATH" \
+      "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 2 && ! -e "$FIXTURE/args" ]]
+}
+
+test_hung_agent_times_out_with_heartbeat() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_SLEEP_SECONDS=5
+  export AGENT_OUTPUT='{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS"}'
+
+  local output
+  output="$(
+    cd "$FIXTURE/repo" || exit 1
+    CURSOR_REVIEW_TIMEOUT_SECONDS=1 \
+    CURSOR_REVIEW_HEARTBEAT_SECONDS=1 \
+    PATH="$FIXTURE/bin:$PATH" \
+      "$ROOT/scripts/review.sh" "Change" 2>&1
+  )"
+  local status=$?
+
+  [[ $status -eq 2 ]] &&
+    [[ "$output" == *"review still running"* ]] &&
+    [[ "$output" == *"timed out after 1 seconds"* ]]
+}
+
 run_test "PASS maps to exit 0 and safe command" test_pass_and_command_contract
 run_test "FAIL maps to exit 1" test_fail_verdict
 run_test "malformed JSON maps to exit 2" test_malformed_json
@@ -230,6 +282,12 @@ run_test "post-verdict harness text preserves standalone verdict" test_post_verd
 run_test "embedded verdict phrase is rejected" test_embedded_verdict_phrase_is_rejected
 run_test "workspace mutation converts PASS to protocol failure" test_workspace_mutation_is_protocol_failure
 run_test "multiple standalone verdicts are rejected" test_multiple_verdict_lines_are_protocol_failure
+run_test "skill requires explicit Cursor request and one review" \
+  test_skill_requires_explicit_cursor_request
+run_test "non-positive timeout is rejected before agent runs" \
+  test_invalid_timeout_is_rejected
+run_test "hung agent emits heartbeat and times out" \
+  test_hung_agent_times_out_with_heartbeat
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
