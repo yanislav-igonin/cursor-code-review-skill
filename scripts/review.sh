@@ -33,12 +33,10 @@ verification="${2:-Not provided}"
   die "usage: review.sh TASK_SUMMARY [VERIFICATION_EVIDENCE]"
 timeout_seconds="${CURSOR_REVIEW_TIMEOUT_SECONDS:-600}"
 heartbeat_seconds="${CURSOR_REVIEW_HEARTBEAT_SECONDS:-30}"
-case "$timeout_seconds" in
-  ''|*[!0-9]*|0) die "CURSOR_REVIEW_TIMEOUT_SECONDS must be a positive integer" ;;
-esac
-case "$heartbeat_seconds" in
-  ''|*[!0-9]*|0) die "CURSOR_REVIEW_HEARTBEAT_SECONDS must be a positive integer" ;;
-esac
+[[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
+  die "CURSOR_REVIEW_TIMEOUT_SECONDS must be a positive integer"
+[[ "$heartbeat_seconds" =~ ^[1-9][0-9]*$ ]] ||
+  die "CURSOR_REVIEW_HEARTBEAT_SECONDS must be a positive integer"
 
 prompt="$(printf '%s\n' \
   'Act as an independent code reviewer. Do not modify files or run destructive commands.' \
@@ -65,7 +63,9 @@ stop_process_group() {
   local pid="$1"
   local signal="${2:-TERM}"
   [[ -n "$pid" ]] || return 0
-  kill "-$signal" -- "-$pid" 2>/dev/null || true
+  kill "-$signal" -- "-$pid" 2>/dev/null ||
+    kill "-$signal" "$pid" 2>/dev/null ||
+    true
 }
 
 cleanup() {
@@ -79,7 +79,7 @@ trap 'exit 2' INT TERM HUP
 before_fingerprint="$(worktree_fingerprint)" ||
   die "could not fingerprint Git worktree before review"
 
-set -m
+set -m || die "could not enable job control for bounded review"
 CURSOR_REVIEW_ACTIVE=1 agent -p \
   --mode=ask \
   --trust \

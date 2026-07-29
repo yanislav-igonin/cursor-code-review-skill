@@ -9,7 +9,8 @@ cleanup_fixture() {
   if [[ -n "${FIXTURE:-}" && -d "$FIXTURE" ]]; then
     rm -rf "$FIXTURE"
   fi
-  unset AGENT_ARGS_FILE AGENT_ENV_FILE AGENT_MUTATE_PATH AGENT_SLEEP_SECONDS
+  unset AGENT_ARGS_FILE AGENT_CHILD_PID_FILE AGENT_ENV_FILE
+  unset AGENT_MUTATE_PATH AGENT_SLEEP_SECONDS
   unset AGENT_OUTPUT AGENT_STDERR AGENT_EXIT
 }
 
@@ -44,7 +45,14 @@ make_fixture() {
     'printf "%s\n" "$@" >"$AGENT_ARGS_FILE"' \
     'printf "%s\n" "${CURSOR_REVIEW_ACTIVE:-}" >"$AGENT_ENV_FILE"' \
     'if [[ -n "${AGENT_MUTATE_PATH:-}" ]]; then printf "mutated\n" >"$AGENT_MUTATE_PATH"; fi' \
-    'sleep "${AGENT_SLEEP_SECONDS:-0}"' \
+    'if [[ -n "${AGENT_CHILD_PID_FILE:-}" ]]; then' \
+    '  sleep "${AGENT_SLEEP_SECONDS:-0}" &' \
+    '  child_pid=$!' \
+    '  printf "%s\n" "$child_pid" >"$AGENT_CHILD_PID_FILE"' \
+    '  wait "$child_pid"' \
+    'else' \
+    '  sleep "${AGENT_SLEEP_SECONDS:-0}"' \
+    'fi' \
     'printf "%s\n" "${AGENT_STDERR:-}" >&2' \
     'printf "%s\n" "${AGENT_OUTPUT:-}"' \
     'exit "${AGENT_EXIT:-0}"' \
@@ -249,6 +257,32 @@ test_invalid_timeout_is_rejected() {
   [[ $? -eq 2 && ! -e "$FIXTURE/args" ]]
 }
 
+test_leading_zero_timeout_is_rejected() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    CURSOR_REVIEW_TIMEOUT_SECONDS=08 PATH="$FIXTURE/bin:$PATH" \
+      "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 2 && ! -e "$FIXTURE/args" ]]
+}
+
+test_leading_zero_heartbeat_is_rejected() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    CURSOR_REVIEW_HEARTBEAT_SECONDS=00 PATH="$FIXTURE/bin:$PATH" \
+      "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 2 && ! -e "$FIXTURE/args" ]]
+}
+
 test_hung_agent_times_out_with_heartbeat() {
   make_fixture
   export AGENT_ARGS_FILE="$FIXTURE/args"
@@ -271,6 +305,33 @@ test_hung_agent_times_out_with_heartbeat() {
     [[ "$output" == *"timed out after 1 seconds"* ]]
 }
 
+test_timeout_terminates_agent_child() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_CHILD_PID_FILE="$FIXTURE/child-pid"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_SLEEP_SECONDS=30
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    CURSOR_REVIEW_TIMEOUT_SECONDS=1 \
+    CURSOR_REVIEW_HEARTBEAT_SECONDS=1 \
+    PATH="$FIXTURE/bin:$PATH" \
+      "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  local status=$?
+  local child_pid
+  child_pid="$(<"$AGENT_CHILD_PID_FILE")"
+
+  [[ $status -eq 2 && -n "$child_pid" ]] &&
+    ! kill -0 "$child_pid" 2>/dev/null
+}
+
+test_runner_fails_closed_when_job_control_cannot_start() {
+  grep -Fq -- 'set -m || die "could not enable job control for bounded review"' \
+    "$ROOT/scripts/review.sh"
+}
+
 run_test "PASS maps to exit 0 and safe command" test_pass_and_command_contract
 run_test "FAIL maps to exit 1" test_fail_verdict
 run_test "malformed JSON maps to exit 2" test_malformed_json
@@ -286,8 +347,16 @@ run_test "skill requires explicit Cursor request and one review" \
   test_skill_requires_explicit_cursor_request
 run_test "non-positive timeout is rejected before agent runs" \
   test_invalid_timeout_is_rejected
+run_test "leading-zero timeout is rejected before agent runs" \
+  test_leading_zero_timeout_is_rejected
+run_test "leading-zero heartbeat is rejected before agent runs" \
+  test_leading_zero_heartbeat_is_rejected
 run_test "hung agent emits heartbeat and times out" \
   test_hung_agent_times_out_with_heartbeat
+run_test "timeout terminates the agent child process" \
+  test_timeout_terminates_agent_child
+run_test "runner fails closed if job control cannot start" \
+  test_runner_fails_closed_when_job_control_cannot_start
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
