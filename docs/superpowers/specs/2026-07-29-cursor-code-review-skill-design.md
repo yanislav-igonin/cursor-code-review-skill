@@ -68,14 +68,18 @@ The script invokes the installed primary Cursor CLI command:
 CURSOR_REVIEW_ACTIVE=1 agent -p \
   --mode=ask \
   --trust \
+  --sandbox=enabled \
   --model cursor-grok-4.5-high \
   --output-format=json \
   --workspace <repository-root> \
   <review-prompt>
 ```
 
-`--mode=ask` keeps the reviewer read-only. The script must not use `--force`,
-`--yolo`, or an agent execution mode that permits edits.
+`--mode=ask` and `--sandbox=enabled` request read-only execution. Because CLI
+enforcement may still permit an unexpected filesystem side effect, the script
+fingerprints Git-visible worktree state before and after the call. Any persistent
+mutation is an operational failure, never approval. The script must not use
+`--force`, `--yolo`, or an agent execution mode that permits edits.
 
 `CURSOR_REVIEW_ACTIVE=1` marks the nested review session. The skill must not
 invoke another Cursor review when this variable is present, preventing recursive
@@ -111,7 +115,7 @@ Each finding contains:
 - evidence or reproduction reasoning;
 - smallest practical fix.
 
-The final response ends with exactly one verdict marker:
+The review result contains exactly one standalone verdict marker:
 
 ```text
 VERDICT: PASS
@@ -136,7 +140,8 @@ It validates:
 - the current directory belongs to a Git worktree;
 - Cursor returns successful JSON;
 - the JSON contains a textual result;
-- the result ends in a recognized verdict marker.
+- the result contains exactly one recognized standalone verdict marker.
+- Git-visible worktree state is unchanged by the reviewer.
 
 It prints the human-readable review result to standard output and uses:
 
@@ -164,6 +169,7 @@ first on `PATH`. They verify:
 - the exact non-Fast model ID `cursor-grok-4.5-high`;
 - read-only `--mode=ask`;
 - absence of `--force` and `--yolo`;
+- enabled Cursor sandbox and rejection of persistent workspace mutations;
 - workspace root resolution;
 - prompt inclusion of task and verification context;
 - PASS, FAIL, malformed JSON, CLI failure, and recursion-guard exit behavior.

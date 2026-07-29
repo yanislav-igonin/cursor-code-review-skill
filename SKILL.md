@@ -1,7 +1,7 @@
 ---
 name: cursor-code-review
 description: Use when an implementation task changed code, tests, configuration, build scripts, generated artifacts, or executable behavior and local verification is complete, before claiming the task is finished.
-compatibility: Requires Bash, Git, jq, network access, and an authenticated Cursor Agent CLI available as agent.
+compatibility: Requires Bash, Git, awk, jq, network access, and an authenticated Cursor Agent CLI available as agent.
 ---
 
 # Cursor Code Review
@@ -43,6 +43,9 @@ start another review.
 ## Review Discipline
 
 - Keep Cursor read-only. Never add `--force`, `--yolo`, or a write-capable mode.
+- The runner fingerprints Git-visible worktree state and turns any persistent
+  reviewer mutation into exit `2`; inspect such changes instead of trusting the
+  verdict.
 - Reject stylistic preferences and speculative refactors outside task scope.
 - Include final Cursor verdict and unresolved validated findings in handoff.
 

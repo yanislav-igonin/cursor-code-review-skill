@@ -9,7 +9,8 @@ cleanup_fixture() {
   if [[ -n "${FIXTURE:-}" && -d "$FIXTURE" ]]; then
     rm -rf "$FIXTURE"
   fi
-  unset AGENT_ARGS_FILE AGENT_ENV_FILE AGENT_OUTPUT AGENT_STDERR AGENT_EXIT
+  unset AGENT_ARGS_FILE AGENT_ENV_FILE AGENT_MUTATE_PATH
+  unset AGENT_OUTPUT AGENT_STDERR AGENT_EXIT
 }
 
 run_test() {
@@ -42,6 +43,7 @@ make_fixture() {
     '#!/usr/bin/env bash' \
     'printf "%s\n" "$@" >"$AGENT_ARGS_FILE"' \
     'printf "%s\n" "${CURSOR_REVIEW_ACTIVE:-}" >"$AGENT_ENV_FILE"' \
+    'if [[ -n "${AGENT_MUTATE_PATH:-}" ]]; then printf "mutated\n" >"$AGENT_MUTATE_PATH"; fi' \
     'printf "%s\n" "${AGENT_STDERR:-}" >&2' \
     'printf "%s\n" "${AGENT_OUTPUT:-}"' \
     'exit "${AGENT_EXIT:-0}"' \
@@ -68,6 +70,7 @@ test_pass_and_command_contract() {
     grep -Fqx -- '-p' "$FIXTURE/args" &&
     grep -Fqx -- '--mode=ask' "$FIXTURE/args" &&
     grep -Fqx -- '--trust' "$FIXTURE/args" &&
+    grep -Fqx -- '--sandbox=enabled' "$FIXTURE/args" &&
     grep -Fqx -- '--output-format=json' "$FIXTURE/args" &&
     grep -Fqx -- 'cursor-grok-4.5-high' "$FIXTURE/args" &&
     grep -Fqx -- "$expected_root" "$FIXTURE/args" &&
@@ -75,6 +78,8 @@ test_pass_and_command_contract() {
     ! grep -Fx -- '--yolo' "$FIXTURE/args" &&
     grep -Fq -- 'Implement tracked change' "$FIXTURE/args" &&
     grep -Fq -- 'tests passed' "$FIXTURE/args" &&
+    grep -Fq -- 'already committed' "$FIXTURE/args" &&
+    grep -Fq -- 'critical, high, medium, or low' "$FIXTURE/args" &&
     grep -Fqx -- '1' "$FIXTURE/env"
 }
 
@@ -161,11 +166,51 @@ test_non_git_directory() {
   [[ $? -eq 2 && ! -e "$FIXTURE/args" ]]
 }
 
-test_verdict_must_be_final() {
+test_post_verdict_harness_text_is_allowed() {
   make_fixture
   export AGENT_ARGS_FILE="$FIXTURE/args"
   export AGENT_ENV_FILE="$FIXTURE/env"
   export AGENT_OUTPUT='{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS\nAdditional text"}'
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    PATH="$FIXTURE/bin:$PATH" "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 0 ]]
+}
+
+test_embedded_verdict_phrase_is_rejected() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_OUTPUT='{"type":"result","subtype":"success","is_error":false,"result":"I cannot give VERDICT: PASS"}'
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    PATH="$FIXTURE/bin:$PATH" "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 2 ]]
+}
+
+test_workspace_mutation_is_protocol_failure() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_MUTATE_PATH="$FIXTURE/repo/reviewer-created.txt"
+  export AGENT_OUTPUT='{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS"}'
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    PATH="$FIXTURE/bin:$PATH" "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 2 && -f "$AGENT_MUTATE_PATH" ]]
+}
+
+test_multiple_verdict_lines_are_protocol_failure() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_OUTPUT='{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: FAIL\nCorrection:\nVERDICT: PASS"}'
 
   (
     cd "$FIXTURE/repo" || exit 1
@@ -181,7 +226,10 @@ run_test "agent failure preserves diagnostics and maps to exit 2" test_agent_fai
 run_test "recursive review is rejected before agent runs" test_recursion_guard
 run_test "missing task summary is rejected before agent runs" test_missing_task_summary
 run_test "non-Git directory is rejected before agent runs" test_non_git_directory
-run_test "verdict marker must be final" test_verdict_must_be_final
+run_test "post-verdict harness text preserves standalone verdict" test_post_verdict_harness_text_is_allowed
+run_test "embedded verdict phrase is rejected" test_embedded_verdict_phrase_is_rejected
+run_test "workspace mutation converts PASS to protocol failure" test_workspace_mutation_is_protocol_failure
+run_test "multiple standalone verdicts are rejected" test_multiple_verdict_lines_are_protocol_failure
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
