@@ -1,7 +1,7 @@
 ---
 name: cursor-code-review
 description: Use only when the user explicitly requests Cursor review, asks to review through Cursor, says "проверь через Cursor" or "запусти Cursor review", or invokes $cursor-code-review or /cursor-code-review. Do not use for generic implementation, completion, verification, or code-review requests that do not name Cursor.
-compatibility: Requires Bash, Git, awk, jq, network access, and an authenticated Cursor Agent CLI available as agent.
+compatibility: Requires Bash, Git, awk, date, jq, mkfifo, network access, and an authenticated Cursor Agent CLI available as agent.
 ---
 
 # Cursor Code Review
@@ -47,6 +47,10 @@ start another review.
   verdict.
 - The runner emits a heartbeat every 30 seconds and stops Cursor after 10
   minutes by default. A timeout is exit `2`, not approval.
+- The runner emits sanitized progress for session, tool, connection, and retry
+  events. Heartbeats report time since the last Cursor event.
+- Progress does not expose assistant text or tool content.
+- Stream idleness alone does not stop the review; only the total timeout does.
 - Reject stylistic preferences and speculative refactors outside task scope.
 - Include final Cursor verdict and unresolved validated findings in handoff.
 

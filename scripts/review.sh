@@ -50,14 +50,72 @@ prompt="$(printf '%s\n' \
   'For each finding include severity (critical, high, medium, or low), file:line when applicable, evidence, and the smallest practical fix.' \
   'Include exactly one standalone verdict line: VERDICT: PASS when there are no actionable findings, otherwise VERDICT: FAIL.')"
 
-stdout_file="$(mktemp)" || die "could not create temporary stdout file"
+stream_file="$(mktemp)" || die "could not create temporary stream file"
 stderr_file="$(mktemp)" || {
-  rm -f "$stdout_file"
+  rm -f "$stream_file"
   die "could not create temporary stderr file"
+}
+activity_file="$(mktemp)" || {
+  rm -f "$stream_file" "$stderr_file"
+  die "could not create temporary activity file"
+}
+stream_pipe="${stream_file}.pipe"
+mkfifo "$stream_pipe" || {
+  rm -f "$stream_file" "$stderr_file" "$activity_file"
+  die "could not create temporary stream pipe"
+}
+date +%s >"$activity_file" || {
+  rm -f "$stream_file" "$stderr_file" "$activity_file" "$stream_pipe"
+  die "could not initialize Cursor activity timestamp"
 }
 timeout_marker="${stderr_file}.timeout"
 agent_pid=""
 monitor_pid=""
+stream_parse_failed=0
+
+process_stream_event() {
+  local event="$1"
+  local fields
+  local event_type
+  local event_subtype
+  local tool_kind
+
+  fields="$(printf '%s' "$event" | jq -er '
+    def string_or_empty: if type == "string" then . else "" end;
+    if type != "object" then error("event must be an object")
+    else [
+      (.type | string_or_empty),
+      (.subtype | string_or_empty),
+      ((.tool_call // {}) |
+        if type == "object" then (keys[0] // "") else "" end)
+    ] | @tsv
+    end
+  ' 2>/dev/null)" || return 1
+
+  IFS=$'\t' read -r event_type event_subtype tool_kind <<<"$fields"
+  date +%s >"$activity_file" || return 1
+  case "$tool_kind" in
+    ''|*[!A-Za-z0-9_-]*) tool_kind="unknownTool" ;;
+  esac
+
+  case "$event_type:$event_subtype" in
+    "system:init")
+      printf 'cursor-code-review: Cursor session started\n' >&2
+      ;;
+    "tool_call:started")
+      printf 'cursor-code-review: Cursor tool started: %s\n' "$tool_kind" >&2
+      ;;
+    "tool_call:completed")
+      printf 'cursor-code-review: Cursor tool completed: %s\n' "$tool_kind" >&2
+      ;;
+    "connection:reconnecting"|"connection:reconnected")
+      printf 'cursor-code-review: Cursor connection %s\n' "$event_subtype" >&2
+      ;;
+    "retry:starting"|"retry:resuming")
+      printf 'cursor-code-review: Cursor retry %s\n' "$event_subtype" >&2
+      ;;
+  esac
+}
 
 stop_process_group() {
   local pid="$1"
@@ -71,7 +129,8 @@ stop_process_group() {
 cleanup() {
   stop_process_group "$monitor_pid" KILL
   stop_process_group "$agent_pid" KILL
-  rm -f "$stdout_file" "$stderr_file" "$timeout_marker"
+  rm -f "$stream_file" "$stderr_file" "$activity_file" "$stream_pipe" \
+    "$timeout_marker"
 }
 
 trap cleanup EXIT
@@ -85,9 +144,9 @@ CURSOR_REVIEW_ACTIVE=1 agent -p \
   --trust \
   --sandbox=enabled \
   --model cursor-grok-4.5-high \
-  --output-format=json \
+  --output-format=stream-json \
   --workspace "$repo_root" \
-  "$prompt" >"$stdout_file" 2>"$stderr_file" &
+  "$prompt" >"$stream_pipe" 2>"$stderr_file" &
 agent_pid=$!
 
 (
@@ -99,7 +158,20 @@ agent_pid=$!
     sleep "$interval"
     elapsed=$((elapsed + interval))
     kill -0 "$agent_pid" 2>/dev/null || exit 0
-    printf 'cursor-code-review: review still running (%ss)\n' "$elapsed" >&2
+    last_activity="$(<"$activity_file")"
+    now="$(date +%s)"
+    case "$last_activity:$now" in
+      *[!0-9:]*|:*|*:)
+        activity_age="unknown"
+        ;;
+      *)
+        activity_age=$((now - last_activity))
+        [[ "$activity_age" -ge 0 ]] || activity_age=0
+        activity_age="${activity_age}s ago"
+        ;;
+    esac
+    printf 'cursor-code-review: review still running (%ss; last Cursor event %s)\n' \
+      "$elapsed" "$activity_age" >&2
     if [[ "$elapsed" -ge "$timeout_seconds" ]]; then
       : >"$timeout_marker"
       stop_process_group "$agent_pid" TERM
@@ -116,6 +188,11 @@ agent_pid=$!
 ) &
 monitor_pid=$!
 
+while IFS= read -r event || [[ -n "$event" ]]; do
+  printf '%s\n' "$event" >>"$stream_file"
+  process_stream_event "$event" || stream_parse_failed=1
+done <"$stream_pipe"
+
 wait "$agent_pid"
 agent_status=$?
 agent_pid=""
@@ -123,7 +200,6 @@ stop_process_group "$monitor_pid" TERM
 wait "$monitor_pid" 2>/dev/null || true
 monitor_pid=""
 set +m
-output="$(<"$stdout_file")"
 after_fingerprint="$(worktree_fingerprint)" ||
   die "could not fingerprint Git worktree after review"
 if [[ "$before_fingerprint" != "$after_fingerprint" ]]; then
@@ -138,10 +214,22 @@ if [[ $agent_status -ne 0 ]]; then
   cat "$stderr_file" >&2
   die "Cursor Agent failed with exit $agent_status"
 fi
+[[ "$stream_parse_failed" -eq 0 ]] ||
+  die "Cursor Agent returned malformed stream JSON"
 
-result="$(printf '%s' "$output" | jq -er \
-  'select(.type == "result" and .subtype == "success" and .is_error == false) | .result | strings' \
-  2>/dev/null)" ||
+terminal_count="$(jq -sr \
+  '[.[] | select(type == "object" and .type == "result")] | length' \
+  "$stream_file" 2>/dev/null)" ||
+  die "Cursor Agent returned malformed stream JSON"
+[[ "$terminal_count" -eq 1 ]] ||
+  die "Cursor Agent stream must contain exactly one terminal result"
+
+result="$(jq -ser '
+  [.[] | select(type == "object" and .type == "result")][0]
+  | select(.subtype == "success" and .is_error == false)
+  | .result
+  | strings
+' "$stream_file" 2>/dev/null)" ||
   die "Cursor Agent returned malformed or unsuccessful JSON"
 
 printf '%s\n' "$result"

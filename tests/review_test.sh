@@ -11,7 +11,7 @@ cleanup_fixture() {
   fi
   unset AGENT_ARGS_FILE AGENT_CHILD_PID_FILE AGENT_ENV_FILE
   unset AGENT_MUTATE_PATH AGENT_SLEEP_SECONDS
-  unset AGENT_OUTPUT AGENT_STDERR AGENT_EXIT
+  unset AGENT_EARLY_OUTPUT AGENT_OUTPUT AGENT_STDERR AGENT_EXIT
 }
 
 run_test() {
@@ -45,6 +45,7 @@ make_fixture() {
     'printf "%s\n" "$@" >"$AGENT_ARGS_FILE"' \
     'printf "%s\n" "${CURSOR_REVIEW_ACTIVE:-}" >"$AGENT_ENV_FILE"' \
     'if [[ -n "${AGENT_MUTATE_PATH:-}" ]]; then printf "mutated\n" >"$AGENT_MUTATE_PATH"; fi' \
+    'if [[ -n "${AGENT_EARLY_OUTPUT:-}" ]]; then printf "%s\n" "$AGENT_EARLY_OUTPUT"; fi' \
     'if [[ -n "${AGENT_CHILD_PID_FILE:-}" ]]; then' \
     '  sleep "${AGENT_SLEEP_SECONDS:-0}" &' \
     '  child_pid=$!' \
@@ -80,7 +81,8 @@ test_pass_and_command_contract() {
     grep -Fqx -- '--mode=ask' "$FIXTURE/args" &&
     grep -Fqx -- '--trust' "$FIXTURE/args" &&
     grep -Fqx -- '--sandbox=enabled' "$FIXTURE/args" &&
-    grep -Fqx -- '--output-format=json' "$FIXTURE/args" &&
+    grep -Fqx -- '--output-format=stream-json' "$FIXTURE/args" &&
+    ! grep -Fqx -- '--stream-partial-output' "$FIXTURE/args" &&
     grep -Fqx -- 'cursor-grok-4.5-high' "$FIXTURE/args" &&
     grep -Fqx -- "$expected_root" "$FIXTURE/args" &&
     ! grep -Fx -- '--force' "$FIXTURE/args" &&
@@ -238,6 +240,10 @@ test_skill_requires_explicit_cursor_request() {
     grep -Fq -- 'A new explicit user request is required for another review' "$skill" &&
     grep -Fq -- 'heartbeat every 30 seconds' "$skill" &&
     grep -Fq -- 'after 10' "$skill" &&
+    grep -Fq -- 'sanitized progress' "$skill" &&
+    grep -Fq -- 'last Cursor event' "$skill" &&
+    grep -Fq -- 'does not expose assistant text or tool content' "$skill" &&
+    grep -Fq -- 'Stream idleness alone does not stop the review' "$skill" &&
     grep -Fq -- 'CURSOR_REVIEW_TIMEOUT_SECONDS:-600' "$runner" &&
     grep -Fq -- 'CURSOR_REVIEW_HEARTBEAT_SECONDS:-30' "$runner" &&
     ! grep -Fq -- 'before claiming the task is finished' "$skill" &&
@@ -302,6 +308,7 @@ test_hung_agent_times_out_with_heartbeat() {
 
   [[ $status -eq 2 ]] &&
     [[ "$output" == *"review still running"* ]] &&
+    [[ "$output" == *"last Cursor event "*"s ago"* ]] &&
     [[ "$output" == *"timed out after 1 seconds"* ]]
 }
 
@@ -332,6 +339,89 @@ test_runner_fails_closed_when_job_control_cannot_start() {
     "$ROOT/scripts/review.sh"
 }
 
+test_missing_terminal_result_is_protocol_failure() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_OUTPUT='{"type":"system","subtype":"init"}'
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    PATH="$FIXTURE/bin:$PATH" "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 2 ]]
+}
+
+test_duplicate_terminal_events_are_protocol_failure() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_OUTPUT=$'{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS"}\n{"type":"result","subtype":"error","is_error":true,"result":"late failure"}'
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    PATH="$FIXTURE/bin:$PATH" "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 2 ]]
+}
+
+test_unsuccessful_terminal_event_is_protocol_failure() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_OUTPUT='{"type":"result","subtype":"error","is_error":true,"result":"VERDICT: PASS"}'
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    PATH="$FIXTURE/bin:$PATH" "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1
+  [[ $? -eq 2 ]]
+}
+
+test_stream_progress_is_early_and_sanitized() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_SLEEP_SECONDS=1
+  export AGENT_EARLY_OUTPUT=$'{"type":"system","subtype":"init","apiKeySource":"SECRET_API_SOURCE"}\n{"type":"tool_call","subtype":"started","tool_call":{"readToolCall":{"args":{"path":"/SECRET/PATH"}}}}\n{"type":"assistant","message":{"content":[{"type":"text","text":"SECRET_ASSISTANT"}]}}\n{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"result":{"success":{"content":"SECRET_TOOL_RESULT"}}}}}\n{"type":"connection","subtype":"reconnecting","detail":"SECRET_CONNECTION"}\n{"type":"future","payload":"SECRET_UNKNOWN"}'
+  export AGENT_OUTPUT='{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS"}'
+  local stdout_file="$FIXTURE/stdout"
+  local stderr_file="$FIXTURE/stderr"
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    PATH="$FIXTURE/bin:$PATH" "$ROOT/scripts/review.sh" "Change"
+  ) >"$stdout_file" 2>"$stderr_file" &
+  local runner_pid=$!
+  local progress_seen=0
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if grep -Fq -- 'Cursor tool completed: readToolCall' "$stderr_file" 2>/dev/null; then
+      progress_seen=1
+      break
+    fi
+    sleep 0.05
+  done
+  local was_running=0
+  kill -0 "$runner_pid" 2>/dev/null && was_running=1
+  wait "$runner_pid"
+  local status=$?
+  local progress
+  progress="$(<"$stderr_file")"
+
+  [[ $status -eq 0 && $progress_seen -eq 1 && $was_running -eq 1 ]] &&
+    [[ "$progress" == *"Cursor session started"* ]] &&
+    [[ "$progress" == *"Cursor tool started: readToolCall"* ]] &&
+    [[ "$progress" == *"Cursor tool completed: readToolCall"* ]] &&
+    [[ "$progress" == *"Cursor connection reconnecting"* ]] &&
+    [[ "$progress" != *"SECRET_API_SOURCE"* ]] &&
+    [[ "$progress" != *"SECRET_ASSISTANT"* ]] &&
+    [[ "$progress" != *"SECRET_TOOL_RESULT"* ]] &&
+    [[ "$progress" != *"SECRET_CONNECTION"* ]] &&
+    [[ "$progress" != *"SECRET_UNKNOWN"* ]] &&
+    [[ "$progress" != *"/SECRET/PATH"* ]]
+}
+
 run_test "PASS maps to exit 0 and safe command" test_pass_and_command_contract
 run_test "FAIL maps to exit 1" test_fail_verdict
 run_test "malformed JSON maps to exit 2" test_malformed_json
@@ -357,6 +447,14 @@ run_test "timeout terminates the agent child process" \
   test_timeout_terminates_agent_child
 run_test "runner fails closed if job control cannot start" \
   test_runner_fails_closed_when_job_control_cannot_start
+run_test "missing terminal result is rejected" \
+  test_missing_terminal_result_is_protocol_failure
+run_test "duplicate terminal events are rejected" \
+  test_duplicate_terminal_events_are_protocol_failure
+run_test "unsuccessful terminal event is rejected" \
+  test_unsuccessful_terminal_event_is_protocol_failure
+run_test "stream progress is visible early and sanitized" \
+  test_stream_progress_is_early_and_sanitized
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
