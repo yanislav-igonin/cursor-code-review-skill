@@ -10,7 +10,8 @@ cleanup_fixture() {
     rm -rf "$FIXTURE"
   fi
   unset AGENT_ARGS_FILE AGENT_CHILD_PID_FILE AGENT_ENV_FILE
-  unset AGENT_MUTATE_PATH AGENT_SLEEP_SECONDS
+  unset AGENT_MUTATE_PATH AGENT_ORPHAN_PID_FILE
+  unset AGENT_ORPHAN_WRITER_SECONDS AGENT_SLEEP_SECONDS
   unset AGENT_EARLY_OUTPUT AGENT_OUTPUT AGENT_STDERR AGENT_EXIT
 }
 
@@ -53,6 +54,10 @@ make_fixture() {
     '  wait "$child_pid"' \
     'else' \
     '  sleep "${AGENT_SLEEP_SECONDS:-0}"' \
+    'fi' \
+    'if [[ -n "${AGENT_ORPHAN_WRITER_SECONDS:-}" ]]; then' \
+    '  sleep "$AGENT_ORPHAN_WRITER_SECONDS" &' \
+    '  printf "%s\n" "$!" >"$AGENT_ORPHAN_PID_FILE"' \
     'fi' \
     'printf "%s\n" "${AGENT_STDERR:-}" >&2' \
     'printf "%s\n" "${AGENT_OUTPUT:-}"' \
@@ -334,6 +339,43 @@ test_timeout_terminates_agent_child() {
     ! kill -0 "$child_pid" 2>/dev/null
 }
 
+test_agent_exit_with_open_fifo_is_bounded() {
+  make_fixture
+  export AGENT_ARGS_FILE="$FIXTURE/args"
+  export AGENT_ENV_FILE="$FIXTURE/env"
+  export AGENT_ORPHAN_PID_FILE="$FIXTURE/orphan-pid"
+  export AGENT_ORPHAN_WRITER_SECONDS=10
+  export AGENT_OUTPUT='{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS"}'
+
+  (
+    cd "$FIXTURE/repo" || exit 1
+    CURSOR_REVIEW_TIMEOUT_SECONDS=1 \
+    CURSOR_REVIEW_HEARTBEAT_SECONDS=1 \
+    PATH="$FIXTURE/bin:$PATH" \
+      "$ROOT/scripts/review.sh" "Change"
+  ) >/dev/null 2>&1 &
+  local runner_pid=$!
+  local finished=0
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    if ! kill -0 "$runner_pid" 2>/dev/null; then
+      finished=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "$finished" -eq 0 ]]; then
+    kill -TERM "$runner_pid" 2>/dev/null || true
+  fi
+  wait "$runner_pid"
+  local status=$?
+  local orphan_pid
+  orphan_pid="$(<"$AGENT_ORPHAN_PID_FILE")"
+
+  [[ $finished -eq 1 && $status -eq 2 && -n "$orphan_pid" ]] &&
+    ! kill -0 "$orphan_pid" 2>/dev/null
+}
+
 test_runner_fails_closed_when_job_control_cannot_start() {
   grep -Fq -- 'set -m || die "could not enable job control for bounded review"' \
     "$ROOT/scripts/review.sh"
@@ -383,7 +425,7 @@ test_stream_progress_is_early_and_sanitized() {
   export AGENT_ARGS_FILE="$FIXTURE/args"
   export AGENT_ENV_FILE="$FIXTURE/env"
   export AGENT_SLEEP_SECONDS=1
-  export AGENT_EARLY_OUTPUT=$'{"type":"system","subtype":"init","apiKeySource":"SECRET_API_SOURCE"}\n{"type":"tool_call","subtype":"started","tool_call":{"readToolCall":{"args":{"path":"/SECRET/PATH"}}}}\n{"type":"assistant","message":{"content":[{"type":"text","text":"SECRET_ASSISTANT"}]}}\n{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"result":{"success":{"content":"SECRET_TOOL_RESULT"}}}}}\n{"type":"connection","subtype":"reconnecting","detail":"SECRET_CONNECTION"}\n{"type":"future","payload":"SECRET_UNKNOWN"}'
+  export AGENT_EARLY_OUTPUT=$'{"type":"system","subtype":"init","apiKeySource":"SECRET_API_SOURCE"}\n{"type":"tool_call","subtype":"started","tool_call":{"readToolCall":{"args":{"path":"/SECRET/PATH"}}}}\n{"type":"assistant","message":{"content":[{"type":"text","text":"SECRET_ASSISTANT"}]}}\n{"type":"tool_call","subtype":"completed","tool_call":{"completedAtMs":123,"readToolCall":{"result":{"success":{"content":"SECRET_TOOL_RESULT"}}}}}\n{"type":"connection","subtype":"reconnecting","detail":"SECRET_CONNECTION"}\n{"type":"retry","subtype":"starting","detail":"SECRET_RETRY"}\n{"type":"future","payload":"SECRET_UNKNOWN"}'
   export AGENT_OUTPUT='{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS"}'
   local stdout_file="$FIXTURE/stdout"
   local stderr_file="$FIXTURE/stderr"
@@ -408,16 +450,21 @@ test_stream_progress_is_early_and_sanitized() {
   local status=$?
   local progress
   progress="$(<"$stderr_file")"
+  local final_output
+  final_output="$(<"$stdout_file")"
 
   [[ $status -eq 0 && $progress_seen -eq 1 && $was_running -eq 1 ]] &&
+    [[ "$final_output" == "VERDICT: PASS" ]] &&
     [[ "$progress" == *"Cursor session started"* ]] &&
     [[ "$progress" == *"Cursor tool started: readToolCall"* ]] &&
     [[ "$progress" == *"Cursor tool completed: readToolCall"* ]] &&
     [[ "$progress" == *"Cursor connection reconnecting"* ]] &&
+    [[ "$progress" == *"Cursor retry starting"* ]] &&
     [[ "$progress" != *"SECRET_API_SOURCE"* ]] &&
     [[ "$progress" != *"SECRET_ASSISTANT"* ]] &&
     [[ "$progress" != *"SECRET_TOOL_RESULT"* ]] &&
     [[ "$progress" != *"SECRET_CONNECTION"* ]] &&
+    [[ "$progress" != *"SECRET_RETRY"* ]] &&
     [[ "$progress" != *"SECRET_UNKNOWN"* ]] &&
     [[ "$progress" != *"/SECRET/PATH"* ]]
 }
@@ -445,6 +492,8 @@ run_test "hung agent emits heartbeat and times out" \
   test_hung_agent_times_out_with_heartbeat
 run_test "timeout terminates the agent child process" \
   test_timeout_terminates_agent_child
+run_test "agent exit with inherited FIFO writer remains bounded" \
+  test_agent_exit_with_open_fifo_is_bounded
 run_test "runner fails closed if job control cannot start" \
   test_runner_fails_closed_when_job_control_cannot_start
 run_test "missing terminal result is rejected" \

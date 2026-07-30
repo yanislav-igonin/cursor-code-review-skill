@@ -55,7 +55,7 @@ The agent writes NDJSON to a temporary FIFO. It remains a directly managed
 background process so the existing process-group timeout and cleanup logic can
 terminate it and its descendants.
 
-The main shell reads the FIFO one line at a time:
+A managed background reader reads the FIFO one line at a time:
 
 1. Validate the line as one JSON object.
 2. Append the original line to a private temporary stream file.
@@ -63,9 +63,12 @@ The main shell reads the FIFO one line at a time:
 4. Emit a sanitized status for recognized operational events.
 5. Ignore unknown event types after recording them.
 
-At end of stream, the runner waits for Cursor and stops the timeout monitor. It
-then performs the existing post-review worktree fingerprint check before
-interpreting the terminal event.
+The main shell waits for Cursor directly. After Cursor exits, it gives the
+reader a short bounded grace period to observe FIFO EOF. If a descendant still
+holds the write end, the runner terminates the Cursor and reader process groups
+and fails closed instead of blocking indefinitely. It then performs the
+existing post-review worktree fingerprint check before interpreting the
+terminal event.
 
 ## Progress Output
 
@@ -149,8 +152,10 @@ exit, timeout marker, and worktree fingerprint remain authoritative.
 
 - The FIFO, raw stream, activity timestamp, stderr file, and timeout marker are
   private temporary files removed by the existing cleanup trap.
-- Cleanup terminates the monitor and Cursor process groups before removing
-  temporary files.
+- Cleanup terminates the monitor, reader, and Cursor process groups before
+  removing temporary files.
+- A Cursor descendant that inherits the FIFO cannot outlive the bounded reader
+  join and keep the runner blocked.
 - A stream parser error does not bypass the after-review fingerprint.
 - Progress output cannot satisfy or alter verdict parsing.
 - The runner never writes a temporary file inside the reviewed repository.

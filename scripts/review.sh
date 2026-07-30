@@ -69,9 +69,12 @@ date +%s >"$activity_file" || {
   die "could not initialize Cursor activity timestamp"
 }
 timeout_marker="${stderr_file}.timeout"
+parse_error_marker="${stderr_file}.parse-error"
+reader_done_marker="${stderr_file}.reader-done"
 agent_pid=""
 monitor_pid=""
-stream_parse_failed=0
+reader_pid=""
+stream_incomplete=0
 
 process_stream_event() {
   local event="$1"
@@ -87,7 +90,9 @@ process_stream_event() {
       (.type | string_or_empty),
       (.subtype | string_or_empty),
       ((.tool_call // {}) |
-        if type == "object" then (keys[0] // "") else "" end)
+        if type == "object" then
+          ([to_entries[] | select(.value | type == "object") | .key][0] // "")
+        else "" end)
     ] | @tsv
     end
   ' 2>/dev/null)" || return 1
@@ -117,6 +122,15 @@ process_stream_event() {
   esac
 }
 
+consume_stream() {
+  local event
+  while IFS= read -r event || [[ -n "$event" ]]; do
+    printf '%s\n' "$event" >>"$stream_file"
+    process_stream_event "$event" || : >"$parse_error_marker"
+  done <"$stream_pipe"
+  : >"$reader_done_marker"
+}
+
 stop_process_group() {
   local pid="$1"
   local signal="${2:-TERM}"
@@ -128,9 +142,10 @@ stop_process_group() {
 
 cleanup() {
   stop_process_group "$monitor_pid" KILL
+  stop_process_group "$reader_pid" KILL
   stop_process_group "$agent_pid" KILL
   rm -f "$stream_file" "$stderr_file" "$activity_file" "$stream_pipe" \
-    "$timeout_marker"
+    "$timeout_marker" "$parse_error_marker" "$reader_done_marker"
 }
 
 trap cleanup EXIT
@@ -188,13 +203,25 @@ agent_pid=$!
 ) &
 monitor_pid=$!
 
-while IFS= read -r event || [[ -n "$event" ]]; do
-  printf '%s\n' "$event" >>"$stream_file"
-  process_stream_event "$event" || stream_parse_failed=1
-done <"$stream_pipe"
+consume_stream &
+reader_pid=$!
 
 wait "$agent_pid"
 agent_status=$?
+reader_join_attempt=0
+while [[ ! -f "$reader_done_marker" && "$reader_join_attempt" -lt 20 ]]; do
+  sleep 0.1
+  reader_join_attempt=$((reader_join_attempt + 1))
+done
+if [[ ! -f "$reader_done_marker" ]]; then
+  stream_incomplete=1
+  stop_process_group "$agent_pid" TERM
+  sleep 0.1
+  stop_process_group "$agent_pid" KILL
+  stop_process_group "$reader_pid" TERM
+fi
+wait "$reader_pid" 2>/dev/null || stream_incomplete=1
+reader_pid=""
 agent_pid=""
 stop_process_group "$monitor_pid" TERM
 wait "$monitor_pid" 2>/dev/null || true
@@ -214,7 +241,9 @@ if [[ $agent_status -ne 0 ]]; then
   cat "$stderr_file" >&2
   die "Cursor Agent failed with exit $agent_status"
 fi
-[[ "$stream_parse_failed" -eq 0 ]] ||
+[[ "$stream_incomplete" -eq 0 ]] ||
+  die "Cursor Agent stream did not close after the agent exited"
+[[ ! -f "$parse_error_marker" ]] ||
   die "Cursor Agent returned malformed stream JSON"
 
 terminal_count="$(jq -sr \

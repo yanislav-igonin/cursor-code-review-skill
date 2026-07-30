@@ -4,7 +4,7 @@
 
 **Goal:** Stream sanitized Cursor activity while preserving the existing final verdict, safety, and timeout contract.
 
-**Architecture:** Cursor writes NDJSON to a temporary FIFO while remaining a directly managed process-group leader. The main shell validates and records each event, emits only coarse operational statuses, and updates a shared activity timestamp read by the existing timeout monitor. After EOF, the runner fingerprints the worktree and accepts exactly one successful terminal result.
+**Architecture:** Cursor writes NDJSON to a temporary FIFO while remaining a directly managed process-group leader. A managed background reader validates and records each event, emits only coarse operational statuses, and updates a shared activity timestamp read by the existing timeout monitor. The main shell waits for Cursor, performs a bounded reader join, fingerprints the worktree, and accepts exactly one successful terminal result.
 
 **Tech Stack:** Bash 3.2+, Cursor Agent CLI, NDJSON, jq, Git, awk, mkfifo
 
